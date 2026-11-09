@@ -2,7 +2,11 @@
 
 <img src="icon.png" alt="WiFi RSSI Enabler icon" width="144">
 
-Replace the Wi-Fi bars in the status bar with the connected network’s signal strength as a white number, such as `-34`. Cellular bars stay visible. On iOS 26, the Control Center readout matches the carrier label’s typography when available.
+WiFi RSSI Enabler replaces the Wi-Fi bars with your iPhone’s RSSI (Received Signal Strength Indicator), a measure of how much Wi-Fi signal power the phone receives from its connected access point. The readout is in dBm, a logarithmic unit referenced to one milliwatt. The status bar shows just the number, so `-34` means **-34 dBm**.
+
+**Closer to zero means a stronger signal.** For example, -50 dBm is stronger than -70 dBm. Watch the number as you move around to spot weak areas or find a better place for your router. RSSI measures signal strength, while download speed depends on other factors too.
+
+Cellular bars stay visible. On iOS 26, the Control Center readout matches the carrier label’s typography when available.
 
 ## Installation
 
