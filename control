@@ -1,0 +1,10 @@
+Package: com.sahinkaa.wifirssienabler
+Name: WiFi RSSI Enabler
+Version: 1.0
+Architecture: iphoneos-arm64e
+Description: Display the connected Wi-Fi network's signal strength in the status bar.
+Maintainer: sahinkaa
+Author: sahinkaa
+Section: Tweaks
+Depends: firmware (>= 16.0), mobilesubstrate
+Homepage: https://github.com/sahinkaa/WiFiRSSIEnabler
