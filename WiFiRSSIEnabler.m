@@ -12,7 +12,8 @@ static int currentRSSI;
 static BOOL usesLegacyStatusBar;
 static UIFont *legacyBatteryFont;
 static uint64_t sampleUptime;
-static char labelKey, maskKey;
+static char labelKey, maskKey, controlCenterWidthKey;
+static BOOL supportsControlCenterSizing;
 static NSHashTable<UIView *> *signalViews;
 static dispatch_source_t sampler;
 
@@ -132,6 +133,18 @@ static void restoreGlyph(UIView *view, UILabel *label, CALayer *mask) {
     [label removeFromSuperview];
 }
 
+static void requestControlCenterWidth(UIView *view, CGFloat width) {
+    NSNumber *previous = objc_getAssociatedObject(view, &controlCenterWidthKey);
+    if (previous.doubleValue == width) return;
+    objc_setAssociatedObject(view, &controlCenterWidthKey, width > 0 ? @(width) : nil,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [view invalidateIntrinsicContentSize];
+    for (UIView *ancestor = view.superview; ancestor && ancestor != view.window; ancestor = ancestor.superview) {
+        [ancestor setNeedsLayout];
+        if ([NSStringFromClass(ancestor.class) hasSuffix:@"StatusBarForegroundView"]) break;
+    }
+}
+
 // Control Center places the Wi-Fi glyph immediately after the carrier text.
 static UILabel *nearbyStatusLabel(UIView *node, UIView *parent, CGRect glyph,
                                   Class stringView, BOOL insideString, NSUInteger depth) {
@@ -152,15 +165,12 @@ static UILabel *nearbyStatusLabel(UIView *node, UIView *parent, CGRect glyph,
     return nil;
 }
 
-static UILabel *controlCenterCarrierLabel(UIView *view) {
+static UIView *leftStatusBarForeground(UIView *view) {
     CGRect glyphInWindow = [view convertRect:view.bounds toView:view.window];
     if (CGRectGetMidX(glyphInWindow) >= CGRectGetMidX(view.window.bounds)) return nil;
 
-    Class stringView = objc_lookUpClass(usesLegacyStatusBar ? "_UIStatusBarStringView" : "STUIStatusBarStringView");
-    if (!stringView) return nil;
     for (UIView *ancestor = view.superview; ancestor && ancestor != view.window; ancestor = ancestor.superview) {
-        if (![NSStringFromClass(ancestor.class) hasSuffix:@"StatusBarForegroundView"]) continue;
-        return nearbyStatusLabel(ancestor, view.superview, view.frame, stringView, NO, 6);
+        if ([NSStringFromClass(ancestor.class) hasSuffix:@"StatusBarForegroundView"]) return ancestor;
     }
     return nil;
 }
@@ -171,13 +181,20 @@ static void updateView(UIView *view) {
     UIView *parent = view.superview;
     if (!currentRSSI || (uint64_t)NSProcessInfo.processInfo.systemUptime - sampleUptime > 15 || !view.window || !parent || view.hidden || view.alpha < 0.01 ||
         CGRectIsEmpty(view.bounds) || (view.layer.mask && view.layer.mask != mask)) {
+        requestControlCenterWidth(view, 0);
         restoreGlyph(view, label, mask);
         return;
     }
 
-    UILabel *carrier = controlCenterCarrierLabel(view);
-    UIFont *font = usesLegacyStatusBar ? nil : carrier.font;
-    if (!usesLegacyStatusBar && carrier.attributedText.length) {
+    UIView *foreground = leftStatusBarForeground(view);
+    Class stringView = objc_lookUpClass(usesLegacyStatusBar ? "_UIStatusBarStringView" : "STUIStatusBarStringView");
+    UILabel *carrier = foreground && stringView ?
+        nearbyStatusLabel(foreground, parent, view.frame, stringView, NO, 6) : nil;
+    // Control Center puts Wi-Fi on the left even when Airplane Mode hides the carrier.
+    BOOL inControlCenter = supportsControlCenterSizing && foreground != nil;
+    UIFont *font = inControlCenter ? [UIFont systemFontOfSize:16 weight:UIFontWeightRegular] : nil;
+    if (!inControlCenter && !usesLegacyStatusBar) font = carrier.font;
+    if (!inControlCenter && !usesLegacyStatusBar && carrier.attributedText.length) {
         id attributedFont = [carrier.attributedText attribute:NSFontAttributeName atIndex:0 effectiveRange:NULL];
         if ([attributedFont isKindOfClass:UIFont.class]) font = attributedFont;
     }
@@ -189,6 +206,7 @@ static void updateView(UIView *view) {
         font = legacyBatteryFont ?: [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
     }
     if (!font) {
+        requestControlCenterWidth(view, 0);
         restoreGlyph(view, label, mask);
         return;
     }
@@ -213,9 +231,24 @@ static void updateView(UIView *view) {
         textRect = [carrier convertRect:textRect toView:parent];
         frame.origin.x = CGRectGetMaxX(textRect) + space;
         frame.origin.y = CGRectGetMidY(textRect) - frame.size.height / 2;
+    } else if (inControlCenter) {
+        frame.origin.x = CGRectGetMinX(view.frame);
     } else if (usesLegacyStatusBar && CGRectGetMidX([view convertRect:view.bounds toView:view.window]) < CGRectGetMidX(view.window.bounds)) {
         frame.origin.x += space;
     }
+
+    if (inControlCenter) {
+        CGFloat leftInset = MAX(0, CGRectGetMinX(frame) - CGRectGetMinX(view.frame));
+        requestControlCenterWidth(view, ceil(leftInset + CGRectGetWidth(frame)));
+        // Keep the stock glyph visible until the system gives the item enough room.
+        if (CGRectGetMaxX(frame) > CGRectGetMaxX(view.frame)) {
+            restoreGlyph(view, label, mask);
+            return;
+        }
+    } else {
+        requestControlCenterWidth(view, 0);
+    }
+
     if (parent.clipsToBounds && !CGRectContainsRect(parent.bounds, frame)) {
         restoreGlyph(view, label, mask);
         return;
@@ -267,6 +300,33 @@ static void hookViewUpdate(Class cls, SEL selector) {
     MSHookMessageEx(cls, selector, hook, &original);
 }
 
+static CGSize controlCenterSize(UIView *view, CGSize stockSize) {
+    if (NSThread.isMainThread) {
+        NSNumber *width = objc_getAssociatedObject(view, &controlCenterWidthKey);
+        if (width) stockSize.width = MAX(stockSize.width, width.doubleValue);
+    }
+    return stockSize;
+}
+
+static void hookControlCenterSizing(Class wifi) {
+    SEL intrinsicSelector = @selector(intrinsicContentSize);
+    __block IMP originalIntrinsic = NULL;
+    IMP intrinsicHook = imp_implementationWithBlock(^CGSize(UIView *view) {
+        CGSize size = ((CGSize (*)(UIView *, SEL))originalIntrinsic)(view, intrinsicSelector);
+        return controlCenterSize(view, size);
+    });
+    MSHookMessageEx(wifi, intrinsicSelector, intrinsicHook, &originalIntrinsic);
+
+    SEL fittingSelector = @selector(sizeThatFits:);
+    __block IMP originalFitting = NULL;
+    IMP fittingHook = imp_implementationWithBlock(^CGSize(UIView *view, CGSize proposed) {
+        CGSize size = ((CGSize (*)(UIView *, SEL, CGSize))originalFitting)(view, fittingSelector, proposed);
+        return controlCenterSize(view, size);
+    });
+    MSHookMessageEx(wifi, fittingSelector, fittingHook, &originalFitting);
+    supportsControlCenterSizing = YES;
+}
+
 __attribute__((constructor)) static void install(void) {
     NSInteger version = NSProcessInfo.processInfo.operatingSystemVersion.majorVersion;
     if (version < 16) return;
@@ -284,6 +344,10 @@ __attribute__((constructor)) static void install(void) {
     }
     if (!wifi) wifi = objc_lookUpClass("_UIStatusBarWifiSignalView");
     if (wifi && [wifi isSubclassOfClass:UIView.class]) {
+        if (wifi == objc_lookUpClass("STUIStatusBarWifiSignalView") &&
+            [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.apple.springboard"]) {
+            hookControlCenterSizing(wifi);
+        }
         hookViewUpdate(wifi, @selector(layoutSubviews));
         hookViewUpdate(wifi, @selector(didMoveToWindow));
         hookViewUpdate(wifi, @selector(didMoveToSuperview));

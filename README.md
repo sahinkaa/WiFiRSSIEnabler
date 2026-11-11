@@ -6,7 +6,7 @@ WiFi RSSI Enabler replaces the Wi-Fi bars with your iPhone’s RSSI (Received Si
 
 **Closer to zero means a stronger signal.** For example, -50 dBm is stronger than -70 dBm. Watch the number as you move around to spot weak areas or find a better place for your router. RSSI measures signal strength, while download speed depends on other factors too.
 
-Cellular bars stay visible. On iOS 26, the Control Center readout matches the carrier label’s typography when available.
+Cellular bars stay visible. On iOS 26, the Control Center readout uses a consistent 16-point regular system font and reserves space for the signed value, including in Airplane Mode.
 
 ## Installation
 
