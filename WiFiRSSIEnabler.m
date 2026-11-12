@@ -12,10 +12,11 @@ static int currentRSSI;
 static BOOL usesLegacyStatusBar;
 static UIFont *legacyBatteryFont;
 static uint64_t sampleUptime;
-static char labelKey, maskKey, controlCenterWidthKey;
+static char labelKey, maskKey;
 static BOOL supportsControlCenterSizing;
 static NSHashTable<UIView *> *signalViews;
 static dispatch_source_t sampler;
+static const CGFloat controlCenterPadding = 2;
 
 static int numberRSSI(CFTypeRef property) {
     if (!property) return 0;
@@ -133,18 +134,6 @@ static void restoreGlyph(UIView *view, UILabel *label, CALayer *mask) {
     [label removeFromSuperview];
 }
 
-static void requestControlCenterWidth(UIView *view, CGFloat width) {
-    NSNumber *previous = objc_getAssociatedObject(view, &controlCenterWidthKey);
-    if (previous.doubleValue == width) return;
-    objc_setAssociatedObject(view, &controlCenterWidthKey, width > 0 ? @(width) : nil,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [view invalidateIntrinsicContentSize];
-    for (UIView *ancestor = view.superview; ancestor && ancestor != view.window; ancestor = ancestor.superview) {
-        [ancestor setNeedsLayout];
-        if ([NSStringFromClass(ancestor.class) hasSuffix:@"StatusBarForegroundView"]) break;
-    }
-}
-
 // Control Center places the Wi-Fi glyph immediately after the carrier text.
 static UILabel *nearbyStatusLabel(UIView *node, UIView *parent, CGRect glyph,
                                   Class stringView, BOOL insideString, NSUInteger depth) {
@@ -166,6 +155,7 @@ static UILabel *nearbyStatusLabel(UIView *node, UIView *parent, CGRect glyph,
 }
 
 static UIView *leftStatusBarForeground(UIView *view) {
+    if (!view.window) return nil;
     CGRect glyphInWindow = [view convertRect:view.bounds toView:view.window];
     if (CGRectGetMidX(glyphInWindow) >= CGRectGetMidX(view.window.bounds)) return nil;
 
@@ -175,29 +165,52 @@ static UIView *leftStatusBarForeground(UIView *view) {
     return nil;
 }
 
+static UILabel *controlCenterCarrierLabel(UIView *view, UIView *foreground) {
+    if (!foreground) return nil;
+    Class stringView = objc_lookUpClass(usesLegacyStatusBar ? "_UIStatusBarStringView" : "STUIStatusBarStringView");
+    return stringView ? nearbyStatusLabel(foreground, view.superview, view.frame, stringView, NO, 6) : nil;
+}
+
+static UIFont *noCarrierRSSIFont(void) {
+    static UIFont *font;
+    if (!font) font = [UIFont systemFontOfSize:16 weight:UIFontWeightRegular];
+    return font;
+}
+
+static CGFloat controlCenterRSSIWidth(void) {
+    static CGFloat width;
+    if (width == 0) {
+        NSDictionary *attributes = @{NSFontAttributeName: noCarrierRSSIFont()};
+        CGFloat widest = 0;
+        for (int magnitude = 10; magnitude <= 99; magnitude++) {
+            NSString *reading = [NSString stringWithFormat:@"−%d", magnitude];
+            CGFloat readingWidth = [reading sizeWithAttributes:attributes].width;
+            widest = MAX(widest, readingWidth);
+        }
+        width = ceil(widest) + 2 * controlCenterPadding;
+    }
+    return width;
+}
+
 static void updateView(UIView *view) {
     UILabel *label = objc_getAssociatedObject(view, &labelKey);
     CALayer *mask = objc_getAssociatedObject(view, &maskKey);
     UIView *parent = view.superview;
     if (!currentRSSI || (uint64_t)NSProcessInfo.processInfo.systemUptime - sampleUptime > 15 || !view.window || !parent || view.hidden || view.alpha < 0.01 ||
         CGRectIsEmpty(view.bounds) || (view.layer.mask && view.layer.mask != mask)) {
-        requestControlCenterWidth(view, 0);
         restoreGlyph(view, label, mask);
         return;
     }
 
     UIView *foreground = leftStatusBarForeground(view);
-    Class stringView = objc_lookUpClass(usesLegacyStatusBar ? "_UIStatusBarStringView" : "STUIStatusBarStringView");
-    UILabel *carrier = foreground && stringView ?
-        nearbyStatusLabel(foreground, parent, view.frame, stringView, NO, 6) : nil;
-    // Control Center puts Wi-Fi on the left even when Airplane Mode hides the carrier.
-    BOOL inControlCenter = supportsControlCenterSizing && foreground != nil;
-    UIFont *font = inControlCenter ? [UIFont systemFontOfSize:16 weight:UIFontWeightRegular] : nil;
-    if (!inControlCenter && !usesLegacyStatusBar) font = carrier.font;
-    if (!inControlCenter && !usesLegacyStatusBar && carrier.attributedText.length) {
+    UILabel *carrier = controlCenterCarrierLabel(view, foreground);
+    BOOL noCarrier = supportsControlCenterSizing && foreground && !carrier;
+    UIFont *font = usesLegacyStatusBar ? nil : carrier.font;
+    if (!usesLegacyStatusBar && carrier.attributedText.length) {
         id attributedFont = [carrier.attributedText attribute:NSFontAttributeName atIndex:0 effectiveRange:NULL];
         if ([attributedFont isKindOfClass:UIFont.class]) font = attributedFont;
     }
+    if (noCarrier) font = noCarrierRSSIFont();
     UIView *ancestor = parent;
     for (NSUInteger level = 0; ancestor && !font && level < 5; level++, ancestor = ancestor.superview) {
         font = batteryFont(ancestor, usesLegacyStatusBar ? 8 : 5);
@@ -206,7 +219,6 @@ static void updateView(UIView *view) {
         font = legacyBatteryFont ?: [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
     }
     if (!font) {
-        requestControlCenterWidth(view, 0);
         restoreGlyph(view, label, mask);
         return;
     }
@@ -219,8 +231,9 @@ static void updateView(UIView *view) {
         label.textColor = UIColor.whiteColor;
         objc_setAssociatedObject(view, &labelKey, label, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    label.font = font;
-    label.text = [NSString stringWithFormat:@"−%d", -currentRSSI];
+    if (![label.font isEqual:font]) label.font = font;
+    NSString *reading = [NSString stringWithFormat:@"−%d", -currentRSSI];
+    if (![label.text isEqualToString:reading]) label.text = reading;
     CGSize size = [label sizeThatFits:CGSizeMake(CGFLOAT_MAX, CGFLOAT_MAX)];
     CGRect frame = CGRectIntegral(CGRectMake(CGRectGetMidX(view.frame) - size.width / 2,
                                               CGRectGetMidY(view.frame) - size.height / 2,
@@ -231,37 +244,25 @@ static void updateView(UIView *view) {
         textRect = [carrier convertRect:textRect toView:parent];
         frame.origin.x = CGRectGetMaxX(textRect) + space;
         frame.origin.y = CGRectGetMidY(textRect) - frame.size.height / 2;
-    } else if (inControlCenter) {
-        frame.origin.x = CGRectGetMinX(view.frame);
+    } else if (noCarrier) {
+        frame.origin.x = CGRectGetMinX(view.frame) + controlCenterPadding;
     } else if (usesLegacyStatusBar && CGRectGetMidX([view convertRect:view.bounds toView:view.window]) < CGRectGetMidX(view.window.bounds)) {
         frame.origin.x += space;
-    }
-
-    if (inControlCenter) {
-        CGFloat leftInset = MAX(0, CGRectGetMinX(frame) - CGRectGetMinX(view.frame));
-        requestControlCenterWidth(view, ceil(leftInset + CGRectGetWidth(frame)));
-        // Keep the stock glyph visible until the system gives the item enough room.
-        if (CGRectGetMaxX(frame) > CGRectGetMaxX(view.frame)) {
-            restoreGlyph(view, label, mask);
-            return;
-        }
-    } else {
-        requestControlCenterWidth(view, 0);
     }
 
     if (parent.clipsToBounds && !CGRectContainsRect(parent.bounds, frame)) {
         restoreGlyph(view, label, mask);
         return;
     }
-    label.frame = frame;
-    label.alpha = view.alpha;
+    if (!CGRectEqualToRect(label.frame, frame)) label.frame = frame;
+    if (label.alpha != view.alpha) label.alpha = view.alpha;
     if (label.superview != parent) [parent insertSubview:label aboveSubview:view];
 
     if (!mask) {
         mask = [CALayer layer];
         objc_setAssociatedObject(view, &maskKey, mask, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    view.layer.mask = mask;
+    if (view.layer.mask != mask) view.layer.mask = mask;
 }
 
 static void updateReading(void) {
@@ -301,9 +302,9 @@ static void hookViewUpdate(Class cls, SEL selector) {
 }
 
 static CGSize controlCenterSize(UIView *view, CGSize stockSize) {
-    if (NSThread.isMainThread) {
-        NSNumber *width = objc_getAssociatedObject(view, &controlCenterWidthKey);
-        if (width) stockSize.width = MAX(stockSize.width, width.doubleValue);
+    if (NSThread.isMainThread && leftStatusBarForeground(view)) {
+        // Keep the same width as carrier text appears or disappears.
+        stockSize.width = controlCenterRSSIWidth();
     }
     return stockSize;
 }
