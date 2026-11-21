@@ -11,7 +11,6 @@ static int readerToken = NOTIFY_TOKEN_INVALID;
 static int currentRSSI;
 static BOOL usesLegacyStatusBar;
 static BOOL isIOS16;
-static UIFont *legacyBatteryFont;
 static uint64_t sampleUptime;
 static char labelKey, maskKey, styleColorKey;
 static BOOL supportsControlCenterLayout;
@@ -72,62 +71,6 @@ static void startSampling(void) {
         notify_post(signalNotification);
     });
     dispatch_resume(sampler);
-}
-
-static UIFont *batteryFont(UIView *view, NSUInteger depth) {
-    const char *names[] = {"STUIStatusBarBatteryView", "_UIStatusBarBatteryView", "_UIBatteryView"};
-    for (NSUInteger index = 0; index < sizeof(names) / sizeof(names[0]); index++) {
-        Class battery = objc_lookUpClass(names[index]);
-        if (!battery || ![view isKindOfClass:battery]) continue;
-        SEL selector = sel_registerName("percentageLabel");
-        Method method = class_getInstanceMethod(object_getClass(view), selector);
-        char type[2] = {0};
-        id object = nil;
-        if (method && method_getNumberOfArguments(method) == 2) {
-            method_getReturnType(method, type, sizeof(type));
-            if (type[0] == '@') object = ((id (*)(id, SEL))objc_msgSend)(view, selector);
-        }
-        if (usesLegacyStatusBar && ![object isKindOfClass:UILabel.class]) {
-            Ivar ivar = class_getInstanceVariable(object_getClass(view), "_percentageLabel");
-            const char *encoding = ivar ? ivar_getTypeEncoding(ivar) : NULL;
-            if (encoding && encoding[0] == '@') object = object_getIvar(view, ivar);
-        }
-        if (![object isKindOfClass:UILabel.class]) continue;
-        UILabel *label = object;
-        if (label.attributedText.length) {
-            id font = [label.attributedText attribute:NSFontAttributeName atIndex:0 effectiveRange:NULL];
-            if ([font isKindOfClass:UIFont.class]) return font;
-        }
-        return label.font;
-    }
-    if (depth > 0) {
-        for (UIView *child in view.subviews) {
-            UIFont *font = batteryFont(child, depth - 1);
-            if (font) return font;
-        }
-    }
-    return nil;
-}
-
-// On older status bars the battery label may be outside the Wi-Fi view hierarchy.
-static void observeLegacyBatteryFont(void) {
-    Class battery = objc_lookUpClass("_UIBatteryView");
-    if (!battery || ![battery isSubclassOfClass:UIView.class]) return;
-    SEL selector = sel_registerName("_updatePercentageFont");
-    Method method = class_getInstanceMethod(battery, selector);
-    if (!method || method_getNumberOfArguments(method) != 2) return;
-    char type[2] = {0};
-    method_getReturnType(method, type, sizeof(type));
-    if (type[0] != 'v') return;
-
-    __block IMP original = NULL;
-    IMP hook = imp_implementationWithBlock(^(UIView *view) {
-        ((void (*)(UIView *, SEL))original)(view, selector);
-        if (!NSThread.isMainThread) return;
-        UIFont *font = batteryFont(view, 0);
-        if (font) legacyBatteryFont = font;
-    });
-    MSHookMessageEx(battery, selector, hook, &original);
 }
 
 static void restoreGlyph(UIView *view, UILabel *label, CALayer *mask) {
@@ -248,6 +191,13 @@ static UILabel *controlCenterCarrierLabel(UIView *view, UIView *foreground) {
     return stringView ? nearbyStatusLabel(foreground, view.superview, view.frame, stringView, NO, 6) : nil;
 }
 
+// Compact status bars use a fixed font even when iOS omits the battery percentage label.
+static UIFont *statusBarRSSIFont(void) {
+    static UIFont *font;
+    if (!font) font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+    return font;
+}
+
 static UIFont *noCarrierRSSIFont(void) {
     static UIFont *font;
     if (!font) font = [UIFont systemFontOfSize:16 weight:UIFontWeightRegular];
@@ -365,17 +315,7 @@ static void updateView(UIView *view) {
     }
     if (noCarrier) font = noCarrierRSSIFont();
     if (ios16ControlCenter) font = ios16ControlCenterFont();
-    UIView *ancestor = parent;
-    for (NSUInteger level = 0; ancestor && !font && level < 5; level++, ancestor = ancestor.superview) {
-        font = batteryFont(ancestor, usesLegacyStatusBar ? 8 : 5);
-    }
-    if (!font && usesLegacyStatusBar) {
-        font = legacyBatteryFont ?: [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-    }
-    if (!font) {
-        restoreGlyph(view, label, mask);
-        return;
-    }
+    if (!font) font = statusBarRSSIFont();
 
     if (!label) {
         label = [UILabel new];
@@ -460,7 +400,6 @@ __attribute__((constructor)) static void install(void) {
     if (version < 16) return;
     usesLegacyStatusBar = version < 26;
     isIOS16 = version == 16;
-    if (usesLegacyStatusBar) observeLegacyBatteryFont();
 
     Class wifi = Nil;
     if (version >= 26) {
